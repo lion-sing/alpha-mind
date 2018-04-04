@@ -7,7 +7,7 @@ Created on 2017-5-5
 
 import unittest
 import numpy as np
-from alphamind.portfolio.linearbuilder import linear_build
+from alphamind.portfolio.linearbuilder import linear_builder
 
 
 class TestLinearBuild(unittest.TestCase):
@@ -23,11 +23,30 @@ class TestLinearBuild(unittest.TestCase):
         bm = self.bm / self.bm.sum()
         eplson = 1e-6
 
-        status, _, w = linear_build(self.er,
-                                    0.,
-                                    0.01,
-                                    self.risk_exp,
-                                    (bm @ self.risk_exp, bm @ self.risk_exp))
+        status, _, w = linear_builder(self.er,
+                                      0.,
+                                      0.01,
+                                      self.risk_exp,
+                                      (bm @ self.risk_exp, bm @ self.risk_exp))
+        self.assertEqual(status, 'optimal')
+        self.assertAlmostEqual(np.sum(w), 1.)
+        self.assertTrue(np.all(w <= 0.01 + eplson))
+        self.assertTrue(np.all(w >= -eplson))
+
+        calc_risk = (w - bm) @ self.risk_exp
+        expected_risk = np.zeros(self.risk_exp.shape[1])
+        np.testing.assert_array_almost_equal(calc_risk, expected_risk)
+
+    def test_linear_build_with_interior(self):
+        bm = self.bm / self.bm.sum()
+        eplson = 1e-6
+
+        status, _, w = linear_builder(self.er,
+                                      0.,
+                                      0.01,
+                                      self.risk_exp,
+                                      (bm @ self.risk_exp, bm @ self.risk_exp),
+                                      method='interior')
         self.assertEqual(status, 'optimal')
         self.assertAlmostEqual(np.sum(w), 1.)
         self.assertTrue(np.all(w <= 0.01 + eplson))
@@ -49,11 +68,11 @@ class TestLinearBuild(unittest.TestCase):
         risk_lbound[:-1] = risk_lbound[:-1] - risk_tolerance
         risk_ubound[:-1] = risk_ubound[:-1] + risk_tolerance
 
-        status, _, w = linear_build(self.er,
-                                    0.,
-                                    0.01,
-                                    self.risk_exp,
-                                    risk_target=(risk_lbound, risk_ubound))
+        status, _, w = linear_builder(self.er,
+                                      0.,
+                                      0.01,
+                                      self.risk_exp,
+                                      risk_target=(risk_lbound, risk_ubound))
         self.assertEqual(status, 'optimal')
         self.assertAlmostEqual(np.sum(w), 1.)
         self.assertTrue(np.all(w <= 0.01 + eplson))
@@ -75,13 +94,13 @@ class TestLinearBuild(unittest.TestCase):
         risk_lbound[:-1] = risk_lbound[:-1] - risk_tolerance
         risk_ubound[:-1] = risk_ubound[:-1] + risk_tolerance
 
-        status, _, w = linear_build(self.er,
-                                    0.,
-                                    0.01,
-                                    self.risk_exp,
-                                    risk_target=(risk_lbound, risk_ubound),
-                                    turn_over_target=turn_over_target,
-                                    current_position=self.current_pos)
+        status, _, w = linear_builder(self.er,
+                                      0.,
+                                      0.01,
+                                      self.risk_exp,
+                                      risk_target=(risk_lbound, risk_ubound),
+                                      turn_over_target=turn_over_target,
+                                      current_position=self.current_pos)
         self.assertEqual(status, 'optimal')
         self.assertAlmostEqual(np.sum(w), 1.)
         self.assertTrue(np.all(w <= 0.01 + eplson))

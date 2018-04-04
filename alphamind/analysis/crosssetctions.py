@@ -10,6 +10,8 @@ import pandas as pd
 import statsmodels.api as sm
 from alphamind.utilities import alpha_logger
 from alphamind.data.processing import factor_processing
+from alphamind.data.winsorize import winsorize_normal
+from alphamind.data.standardize import standardize
 
 
 def cs_impl(ref_date,
@@ -20,7 +22,8 @@ def cs_impl(ref_date,
             industry_matrix,
             dx_returns):
     total_data = pd.merge(factor_data, risk_exposure, on='code')
-    total_data = pd.merge(total_data, industry_matrix, on='code').dropna()
+    total_data = pd.merge(total_data, industry_matrix, on='code')
+    total_data = total_data.replace([np.inf, -np.inf], np.nan).dropna()
 
     if len(total_data) < 0.33 * len(factor_data):
         alpha_logger.warning(f"valid data point({len(total_data)}) "
@@ -29,8 +32,8 @@ def cs_impl(ref_date,
 
     total_risk_exp = total_data[constraint_risk]
 
-    er = total_data[factor_name].values.astype(float)
-    er = factor_processing(er, [], total_risk_exp.values, []).flatten()
+    er = total_data[[factor_name]].values.astype(float)
+    er = factor_processing(er, [winsorize_normal, standardize], total_risk_exp.values, [standardize]).flatten()
     industry = total_data.industry_name.values
 
     codes = total_data.code.tolist()
@@ -40,8 +43,13 @@ def cs_impl(ref_date,
     target_pos['weight'] = target_pos['weight'] / target_pos['weight'].abs().sum()
     target_pos = pd.merge(target_pos, dx_returns, on=['code'])
     target_pos = pd.merge(target_pos, total_data[['code'] + constraint_risk], on=['code'])
-    activate_weight = target_pos.weight.values
-    excess_return = np.exp(target_pos.dx.values) - 1.
+    total_risk_exp = target_pos[constraint_risk]
+    activate_weight = target_pos['weight'].values
+    excess_return = np.exp(target_pos[['dx']].values) - 1.
+    excess_return = factor_processing(excess_return,
+                                      [winsorize_normal, standardize],
+                                      total_risk_exp.values,
+                                      [winsorize_normal, standardize]).flatten()
     port_ret = np.log(activate_weight @ excess_return + 1.)
     ic = np.corrcoef(excess_return, activate_weight)[0, 1]
     x = sm.add_constant(activate_weight)
@@ -71,10 +79,7 @@ def cross_section_analysis(ref_date,
 
 
 if __name__ == '__main__':
-    import numpy as np
-    import pandas as pd
-    import statsmodels.api as sm
-    from alphamind.api import *
+    from alphamind.api import SqlEngine, Universe, risk_styles, industry_styles
 
     factor_name = 'SIZE'
     data_source = 'postgres+psycopg2://postgres:A12345678!@10.63.6.220/alpha'
