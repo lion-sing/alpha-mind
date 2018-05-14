@@ -2,11 +2,14 @@
 
 <table>
 <tr>
+  <td>Python version</td>
+  <td><img src="https://img.shields.io/badge/python-3.6-blue.svg"/> </td>
+  </tr>
+<tr>
+<tr>
   <td>Build Status</td>
   <td>
-    <a href="https://travis-ci.org/alpha-miner/alpha-mind">
     <img src="https://travis-ci.org/alpha-miner/alpha-mind.svg?branch=master" alt="travis build status" />
-    </a>
   </td>
 </tr>
 <tr>
@@ -16,6 +19,16 @@
 </table>
 
 **Alpha - Mind** 是基于 **Python** 开发的股票多因子研究框架。
+
+## 依赖
+
+该项目主要有两个主要的github外部依赖：
+
+* [portfolio - optimizer](https://github.com/alpha-miner/portfolio-optimizer)：该项目是相同作者编写的用于资产组合配置的优化器工具包；
+
+* [xgboost](https://github.com/dmlc/xgboost)： 该项目是alpha - mind中一些机器模型的基础库。
+
+这两个库都已经使用git子模块的方式打包到alpha-mind代码库中。
 
 ## 功能
 
@@ -36,24 +49,37 @@ alpha - mind 提供了多因子研究中常用的工具链，包括：
 * pandas
 * scipy
 
-## 获取代码
-
-```
-git clone https://github.com/alpha-miner/alpha-mind.git
-cd alpha-mind
-git submodule init
-git submodule update
-```
+同时还依赖于一个工具包
+* [Finance-Python](https://github.com/alpha-miner/Finance-Python)
 
 ## 编译依赖
 
 * Windows
 
-  在Windows上完整安装，需要有C++编译器(例如msvc）:
-
-    ```bash
-    build_windows_dependencies.bat
-    ```
+  在Windows上完整安装，需要有C++编译器(例如msvc)
+  
+  具体可按照如下流程配置(以VS2015为例)：
+  
+  1. 安装VS2015 社区版，在微软官网可以免费下载。 
+  2. 安装CMake, 可以从[官网](https://cmake.org/download/)下载二进制安装文件，如"Windows win64-x64 ZIP"，解压缩后环境变量的设置可以参见[此文](https://blog.csdn.net/liyuebit/article/details/77092723)
+     
+     - 可以按照文中的例子，尝试使用如下CMake命令编译一个HelloWorld项目。
+     ```bash
+     cmake -G "Visual Studio 14 2015 Win64"
+     ```
+     - 将MSBuild的路径(默认是"C:\Program Files (x86)\MSBuild\14.0\Bin"")加入环境变量中。
+  
+  3. 在项目子目录"\alphamind\pfopt"下使用如下命令进行更新，确保所需文件都已经拷贝到本地。
+     ```
+     git submodule init
+     git submodule update
+     ```
+     
+  4. 在项目根目录下双击批处理文件"build_windows_dependencies.bat"或者通过命令行执行	
+     ```bash
+     build_windows_dependencies.bat
+     ```
+     随后一系列依赖项目会自动编译。可能有若干警告，但没有错误。
 
 * Linux
 
@@ -65,7 +91,21 @@ git submodule update
 
 ## 安装
 
-alpha - mind 的安装极其简单，在编译完成依赖之后，运行：
+安装需要直接clone或者下载源代码安装，具体流程为：
+
+1. 克隆项目到本地
+```
+git clone https://github.com/alpha-miner/alpha-mind.git
+cd alpha-mind
+git submodule init
+git submodule update
+```
+
+2. 参照上节内容，编译好依赖的子项目。
+
+3. 确保环境变量'VS90COMNTOOLS'的值为安装的VS的Comntools下的地址，如'\vs2015\Common7\Tools\'
+
+4. 回到项目的根目录下运行：
 
 ```python
 python setup.py install

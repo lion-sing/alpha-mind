@@ -8,6 +8,7 @@ Created on 2017-9-27
 import copy
 import bisect
 from typing import Iterable
+import numpy as np
 import pandas as pd
 from simpleutils.miscellaneous import list_eq
 from alphamind.model.modelbase import ModelBase
@@ -19,6 +20,7 @@ from alphamind.data.winsorize import winsorize_normal
 from alphamind.data.rank import rank
 from alphamind.data.standardize import standardize
 from alphamind.model.loader import load_model
+from alphamind.model.linearmodel import ConstLinearModel
 
 PROCESS_MAPPING = {
     'winsorize_normal': winsorize_normal,
@@ -47,7 +49,6 @@ class DataMeta(object):
                  warm_start: int = 0,
                  data_source: str = None):
         self.data_source = data_source
-        self.engine = SqlEngine(self.data_source)
         self.freq = freq
         self.universe = universe
         self.batch = batch
@@ -106,7 +107,7 @@ class DataMeta(object):
     def fetch_train_data(self,
                          ref_date,
                          alpha_model: ModelBase):
-        return fetch_train_phase(self.engine,
+        return fetch_train_phase(SqlEngine(self.data_source),
                                  alpha_model.formulas,
                                  ref_date,
                                  self.freq,
@@ -116,12 +117,13 @@ class DataMeta(object):
                                  self.risk_model,
                                  self.pre_process,
                                  self.post_process,
-                                 self.warm_start)
+                                 self.warm_start,
+                                 fit_target=alpha_model.fit_target)
 
     def fetch_predict_data(self,
                            ref_date: str,
                            alpha_model: ModelBase):
-        return fetch_predict_phase(self.engine,
+        return fetch_predict_phase(SqlEngine(self.data_source),
                                    alpha_model.formulas,
                                    ref_date,
                                    self.freq,
@@ -132,7 +134,8 @@ class DataMeta(object):
                                    self.pre_process,
                                    self.post_process,
                                    self.warm_start,
-                                   fillna=True)
+                                   fillna=True,
+                                   fit_target=alpha_model.fit_target)
 
 
 def train_model(ref_date: str,
@@ -141,11 +144,13 @@ def train_model(ref_date: str,
                 x_values: pd.DataFrame = None,
                 y_values: pd.DataFrame = None):
     base_model = copy.deepcopy(alpha_model)
-    if x_values is None:
-        train_data = data_meta.fetch_train_data(ref_date, alpha_model)
-        x_values = train_data['train']['x']
-        y_values = train_data['train']['y']
-    base_model.fit(x_values, y_values)
+
+    if not isinstance(alpha_model, ConstLinearModel):
+        if x_values is None:
+            train_data = data_meta.fetch_train_data(ref_date, alpha_model)
+            x_values = train_data['train']['x']
+            y_values = train_data['train']['y']
+        base_model.fit(x_values, y_values)
     return base_model
 
 
@@ -185,6 +190,28 @@ class Composer(object):
             codes = x.index
             return pd.DataFrame(model.predict(x_values).flatten(), index=codes)
 
+    def score(self, ref_date: str, x: pd.DataFrame = None, y: np.ndarray = None, d_type: str = 'test') -> float:
+        model = self._fetch_latest_model(ref_date)
+        if x is None:
+            if d_type == 'test':
+                test_data = self.data_meta.fetch_predict_data(ref_date, model)
+                x = test_data['predict']['x']
+                if y is None:
+                    y = test_data['predict']['y']
+            else:
+                test_data = self.data_meta.fetch_train_data(ref_date, model)
+                x = test_data['train']['x']
+                if y is None:
+                    y = test_data['train']['y']
+        return model.score(x, y)
+
+    def ic(self, ref_date) -> float:
+        model = self._fetch_latest_model(ref_date)
+        test_data = self.data_meta.fetch_predict_data(ref_date, model)
+        x = test_data['predict']['x']
+        y = test_data['predict']['y']
+        return model.ic(x, y)
+
     def _fetch_latest_model(self, ref_date) -> ModelBase:
         if self.is_updated:
             sorted_keys = self.sorted_keys
@@ -195,6 +222,9 @@ class Composer(object):
 
         latest_index = bisect.bisect_left(sorted_keys, ref_date) - 1
         return self.models[sorted_keys[latest_index]]
+
+    def __getitem__(self, ref_date) -> ModelBase:
+        return self.models[ref_date]
 
     def save(self) -> dict:
         return dict(
@@ -210,35 +240,71 @@ class Composer(object):
 
 
 if __name__ == '__main__':
-    import numpy as np
-    from alphamind.data.standardize import standardize
-    from alphamind.data.winsorize import winsorize_normal
-    from alphamind.data.engines.sqlengine import industry_styles
-    from alphamind.model.linearmodel import ConstLinearModel
+    from alphamind.api import (risk_styles,
+                               industry_styles,
+                               standardize,
+                               winsorize_normal,
+                               DataMeta,
+                               LinearRegression,
+                               fetch_data_package,
+                               map_freq)
+    from PyFin.api import LAST, SHIFT
 
-    data_source = "postgres+psycopg2://postgres:we083826@localhost/alpha"
-    alpha_model = ConstLinearModel(['EPS'], np.array([1.]))
-    alpha_factors = ['EPS']
-    freq = '1w'
-    universe = Universe('zz500', ['zz500'])
-    batch = 4
-    neutralized_risk = ['SIZE'] + industry_styles
+    freq = '60b'
+    universe = Universe('custom', ['ashare_ex'])
+    batch = 1
+    neutralized_risk = industry_styles
     risk_model = 'short'
     pre_process = [winsorize_normal, standardize]
-    pos_process = [winsorize_normal, standardize]
+    post_process = [standardize]
+    warm_start = 3
+    data_source = None
+    horizon = map_freq(freq)
 
-    data_meta = DataMeta(freq,
-                         universe,
-                         batch,
-                         neutralized_risk,
-                         risk_model,
-                         pre_process,
-                         pos_process,
+    engine = SqlEngine(data_source)
+
+    fit_intercept = True
+    kernal_feature = 'roe_q'
+    regress_features = {kernal_feature: LAST(kernal_feature),
+                        kernal_feature + '_l1': SHIFT(kernal_feature, 1),
+                        kernal_feature + '_l2': SHIFT(kernal_feature, 2),
+                        kernal_feature + '_l3': SHIFT(kernal_feature, 3)
+                        }
+    const_features = {kernal_feature: LAST(kernal_feature)}
+    fit_target = [kernal_feature]
+
+    data_meta = DataMeta(freq=freq,
+                         universe=universe,
+                         batch=batch,
+                         neutralized_risk=neutralized_risk,
+                         risk_model=risk_model,
+                         pre_process=pre_process,
+                         post_process=post_process,
+                         warm_start=warm_start,
                          data_source=data_source)
 
-    composer = Composer(alpha_model, data_meta)
+    alpha_model = LinearRegression(features=regress_features, fit_intercept=True, fit_target=fit_target)
+    composer = Composer(alpha_model=alpha_model, data_meta=data_meta)
 
-    composer.train('2017-09-20')
-    composer.train('2017-09-22')
-    composer.train('2017-09-25')
-    composer.predict('2017-09-21')
+    start_date = '2014-01-01'
+    end_date = '2016-01-01'
+
+    regression_model = LinearRegression(features=regress_features, fit_intercept=fit_intercept, fit_target=fit_target)
+    regression_composer = Composer(alpha_model=regression_model, data_meta=data_meta)
+    #regression_composer.train('2010-07-07')
+
+    data_package1 = fetch_data_package(engine,
+                                       alpha_factors=[kernal_feature],
+                                       start_date=start_date,
+                                       end_date=end_date,
+                                       frequency=freq,
+                                       universe=universe,
+                                       benchmark=906,
+                                       warm_start=warm_start,
+                                       batch=1,
+                                       neutralized_risk=neutralized_risk,
+                                       pre_process=pre_process,
+                                       post_process=post_process,
+                                       fit_target=fit_target)
+
+    pass

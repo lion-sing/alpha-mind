@@ -26,16 +26,15 @@ from alphamind.utilities import alpha_logger
 from alphamind.utilities import map_freq
 
 
-def _merge_df(engine, names, factor_df, return_df, universe, dates, risk_model, neutralized_risk):
+def _merge_df(engine, names, factor_df, target_df, universe, dates, risk_model, neutralized_risk):
     risk_df = engine.fetch_risk_model_range(universe, dates=dates, risk_model=risk_model)[1]
-    alpha_logger.info("risk data loading finished")
     used_neutralized_risk = list(set(total_risk_factors).difference(names))
     risk_df = risk_df[['trade_date', 'code'] + used_neutralized_risk].dropna()
-    return_df = pd.merge(return_df, risk_df, on=['trade_date', 'code'])
+    target_df = pd.merge(target_df, risk_df, on=['trade_date', 'code']).dropna()
 
     if neutralized_risk:
         train_x = pd.merge(factor_df, risk_df, on=['trade_date', 'code'])
-        train_y = return_df.copy()
+        train_y = target_df.copy()
 
         risk_exp = train_x[neutralized_risk].values.astype(float)
         x_values = train_x[names].values.astype(float)
@@ -43,14 +42,14 @@ def _merge_df(engine, names, factor_df, return_df, universe, dates, risk_model, 
     else:
         risk_exp = None
         train_x = factor_df.copy()
-        train_y = return_df.copy()
+        train_y = target_df.copy()
         x_values = train_x[names].values.astype(float)
         y_values = train_y[['dx']].values
 
     codes = train_x['code'].values
     date_label = pd.DatetimeIndex(factor_df.trade_date).to_pydatetime()
     dates = np.unique(date_label)
-    return return_df, dates, date_label, risk_exp, x_values, y_values, train_x, train_y, codes
+    return target_df, dates, date_label, risk_exp, x_values, y_values, train_x, train_y, codes
 
 
 def prepare_data(engine: SqlEngine,
@@ -60,7 +59,8 @@ def prepare_data(engine: SqlEngine,
                  frequency: str,
                  universe: Universe,
                  benchmark: int,
-                 warm_start: int = 0):
+                 warm_start: int = 0,
+                 fit_target: Union[Transformer, object]=None):
     if warm_start > 0:
         p = Period(frequency)
         p = Period(length=-warm_start * p.length(), units=p.units())
@@ -86,17 +86,26 @@ def prepare_data(engine: SqlEngine,
                                           factors=transformer,
                                           dates=dates).sort_values(['trade_date', 'code'])
     alpha_logger.info("factor data loading finished")
-    return_df = engine.fetch_dx_return_range(universe, dates=dates, horizon=horizon)
-    alpha_logger.info("return data loading finished")
+
+    if fit_target is None:
+        target_df = engine.fetch_dx_return_range(universe, dates=dates, horizon=horizon)
+    else:
+        one_more_date = advanceDateByCalendar('china.sse', dates[-1], frequency)
+        target_df = engine.fetch_factor_range_forward(universe, factors=fit_target, dates=dates + [one_more_date])
+        target_df = target_df[target_df.trade_date.isin(dates)]
+        target_df = target_df.groupby('code').apply(lambda x: x.fillna(method='pad'))
+    alpha_logger.info("fit target data loading finished")
+
     industry_df = engine.fetch_industry_range(universe, dates=dates)
     alpha_logger.info("industry data loading finished")
     benchmark_df = engine.fetch_benchmark_range(benchmark, dates=dates)
     alpha_logger.info("benchmark data loading finished")
 
-    df = pd.merge(factor_df, return_df, on=['trade_date', 'code']).dropna()
+    df = pd.merge(factor_df, target_df, on=['trade_date', 'code']).dropna()
     df = pd.merge(df, benchmark_df, on=['trade_date', 'code'], how='left')
     df = pd.merge(df, industry_df, on=['trade_date', 'code'])
     df['weight'] = df['weight'].fillna(0.)
+    df.dropna(inplace=True)
 
     return dates, df[['trade_date', 'code', 'dx']], df[
         ['trade_date', 'code', 'weight', 'isOpen', 'industry_code', 'industry'] + transformer.names]
@@ -199,32 +208,34 @@ def fetch_data_package(engine: SqlEngine,
                        neutralized_risk: Iterable[str] = None,
                        risk_model: str = 'short',
                        pre_process: Iterable[object] = None,
-                       post_process: Iterable[object] = None) -> dict:
+                       post_process: Iterable[object] = None,
+                       fit_target: Union[Transformer, object] = None) -> dict:
     alpha_logger.info("Starting data package fetching ...")
     transformer = Transformer(alpha_factors)
     names = transformer.names
-    dates, return_df, factor_df = prepare_data(engine,
+    dates, target_df, factor_df = prepare_data(engine,
                                                transformer,
                                                start_date,
                                                end_date,
                                                frequency,
                                                universe,
                                                benchmark,
-                                               warm_start)
+                                               warm_start + batch,
+                                               fit_target=fit_target)
 
-    return_df, dates, date_label, risk_exp, x_values, y_values, train_x, train_y, codes = \
-        _merge_df(engine, names, factor_df, return_df, universe, dates, risk_model, neutralized_risk)
+    target_df, dates, date_label, risk_exp, x_values, y_values, train_x, train_y, codes = \
+        _merge_df(engine, names, factor_df, target_df, universe, dates, risk_model, neutralized_risk)
 
     alpha_logger.info("data merging finished")
 
-    return_df['weight'] = train_x['weight']
-    return_df['industry'] = train_x['industry']
-    return_df['industry_code'] = train_x['industry_code']
-    return_df['isOpen'] = train_x['isOpen']
+    target_df['weight'] = train_x['weight']
+    target_df['industry'] = train_x['industry']
+    target_df['industry_code'] = train_x['industry_code']
+    target_df['isOpen'] = train_x['isOpen']
 
     if neutralized_risk:
         for i, name in enumerate(neutralized_risk):
-            return_df.loc[:, name] = risk_exp[:, i]
+            target_df.loc[:, name] = risk_exp[:, i]
 
     alpha_logger.info("Loading data is finished")
 
@@ -244,7 +255,17 @@ def fetch_data_package(engine: SqlEngine,
 
     ret = dict()
     ret['x_names'] = names
-    ret['settlement'] = return_df
+    ret['settlement'] = target_df[target_df.trade_date >= start_date]
+
+    train_x_buckets = {k: train_x_buckets[k] for k in train_x_buckets if k.strftime('%Y-%m-%d') >= start_date}
+    train_y_buckets = {k: train_y_buckets[k] for k in train_y_buckets if k.strftime('%Y-%m-%d') >= start_date}
+    train_risk_buckets = {k: train_risk_buckets[k] for k in train_risk_buckets if k.strftime('%Y-%m-%d') >= start_date}
+
+    predict_x_buckets = {k: predict_x_buckets[k] for k in predict_x_buckets if k.strftime('%Y-%m-%d') >= start_date}
+    predict_y_buckets = {k: predict_y_buckets[k] for k in predict_y_buckets if k.strftime('%Y-%m-%d') >= start_date}
+    predict_risk_buckets = {k: predict_risk_buckets[k] for k in predict_risk_buckets if k.strftime('%Y-%m-%d') >= start_date}
+    predict_codes_bucket = {k: predict_codes_bucket[k] for k in predict_codes_bucket if k.strftime('%Y-%m-%d') >= start_date}
+
     ret['train'] = {'x': train_x_buckets, 'y': train_y_buckets, 'risk': train_risk_buckets}
     ret['predict'] = {'x': predict_x_buckets, 'y': predict_y_buckets, 'risk': predict_risk_buckets,
                       'code': predict_codes_bucket}
@@ -256,19 +277,20 @@ def fetch_train_phase(engine,
                       ref_date,
                       frequency,
                       universe,
-                      batch,
+                      batch=1,
                       neutralized_risk: Iterable[str] = None,
                       risk_model: str = 'short',
                       pre_process: Iterable[object] = None,
                       post_process: Iterable[object] = None,
-                      warm_start: int = 0) -> dict:
+                      warm_start: int = 0,
+                      fit_target: Union[Transformer, object] = None) -> dict:
     if isinstance(alpha_factors, Transformer):
         transformer = alpha_factors
     else:
         transformer = Transformer(alpha_factors)
 
     p = Period(frequency)
-    p = Period(length=-(warm_start + batch + 1) * p.length(), units=p.units())
+    p = Period(length=-(warm_start + batch) * p.length(), units=p.units())
 
     start_date = advanceDateByCalendar('china.sse', ref_date, p, BizDayConventions.Following)
     dates = makeSchedule(start_date,
@@ -281,15 +303,21 @@ def fetch_train_phase(engine,
     horizon = map_freq(frequency)
 
     factor_df = engine.fetch_factor_range(universe, factors=transformer, dates=dates)
-    return_df = engine.fetch_dx_return_range(universe, dates=dates, horizon=horizon)
+    if fit_target is None:
+        target_df = engine.fetch_dx_return_range(universe, dates=dates, horizon=horizon)
+    else:
+        one_more_date = advanceDateByCalendar('china.sse', dates[-1], frequency)
+        target_df = engine.fetch_factor_range_forward(universe, factors=fit_target, dates=dates + [one_more_date])
+        target_df = target_df[target_df.trade_date.isin(dates)]
+        target_df = target_df.groupby('code').apply(lambda x: x.fillna(method='pad'))
 
-    df = pd.merge(factor_df, return_df, on=['trade_date', 'code']).dropna()
+    df = pd.merge(factor_df, target_df, on=['trade_date', 'code']).dropna()
 
-    return_df, factor_df = df[['trade_date', 'code', 'dx']], df[
+    target_df, factor_df = df[['trade_date', 'code', 'dx']], df[
         ['trade_date', 'code', 'isOpen'] + transformer.names]
 
-    return_df, dates, date_label, risk_exp, x_values, y_values, _, _, codes = \
-        _merge_df(engine, transformer.names, factor_df, return_df, universe, dates, risk_model, neutralized_risk)
+    target_df, dates, date_label, risk_exp, x_values, y_values, _, _, codes = \
+        _merge_df(engine, transformer.names, factor_df, target_df, universe, dates, risk_model, neutralized_risk)
 
     if dates[-1] == dt.datetime.strptime(ref_date, '%Y-%m-%d'):
         pyFinAssert(len(dates) >= 2, ValueError, "No previous data for training for the date {0}".format(ref_date))
@@ -330,20 +358,21 @@ def fetch_predict_phase(engine,
                         ref_date,
                         frequency,
                         universe,
-                        batch,
+                        batch=1,
                         neutralized_risk: Iterable[str] = None,
                         risk_model: str = 'short',
                         pre_process: Iterable[object] = None,
                         post_process: Iterable[object] = None,
                         warm_start: int = 0,
-                        fillna: str=None):
+                        fillna: str = None,
+                        fit_target: Union[Transformer, object] = None):
     if isinstance(alpha_factors, Transformer):
         transformer = alpha_factors
     else:
         transformer = Transformer(alpha_factors)
 
     p = Period(frequency)
-    p = Period(length=-(warm_start + batch) * p.length(), units=p.units())
+    p = Period(length=-(warm_start + batch - 1) * p.length(), units=p.units())
 
     start_date = advanceDateByCalendar('china.sse', ref_date, p, BizDayConventions.Following)
     dates = makeSchedule(start_date,
@@ -353,12 +382,23 @@ def fetch_predict_phase(engine,
                          dateRule=BizDayConventions.Following,
                          dateGenerationRule=DateGeneration.Backward)
 
+    horizon = map_freq(frequency)
+
     factor_df = engine.fetch_factor_range(universe, factors=transformer, dates=dates)
 
     if fillna:
-        factor_df = factor_df.groupby('trade_date').apply(lambda x: x.fillna(x.median())).reset_index(drop=True).dropna()
+        factor_df = factor_df.groupby('trade_date').apply(lambda x: x.fillna(x.median())).reset_index(
+            drop=True).dropna()
     else:
         factor_df = factor_df.dropna()
+
+    if fit_target is None:
+        target_df = engine.fetch_dx_return_range(universe, dates=dates, horizon=horizon)
+    else:
+        one_more_date = advanceDateByCalendar('china.sse', dates[-1], frequency)
+        target_df = engine.fetch_factor_range_forward(universe, factors=fit_target, dates=dates + [one_more_date])
+        target_df = target_df[target_df.trade_date.isin(dates)]
+        target_df = target_df.groupby('code').apply(lambda x: x.fillna(method='pad'))
 
     names = transformer.names
 
@@ -367,13 +407,17 @@ def fetch_predict_phase(engine,
         used_neutralized_risk = list(set(neutralized_risk).difference(names))
         risk_df = risk_df[['trade_date', 'code'] + used_neutralized_risk].dropna()
         train_x = pd.merge(factor_df, risk_df, on=['trade_date', 'code'])
+        train_x = pd.merge(train_x, target_df, on=['trade_date', 'code'], how='left')
         risk_exp = train_x[neutralized_risk].values.astype(float)
     else:
-        train_x = factor_df.copy()
+        train_x = pd.merge(factor_df, target_df, on=['trade_date', 'code'], how='left')
         risk_exp = None
-    x_values = train_x[names].values.astype(float)
 
-    date_label = pd.DatetimeIndex(factor_df.trade_date).to_pydatetime()
+    train_x.dropna(inplace=True, subset=train_x.columns[:-1])
+    x_values = train_x[names].values.astype(float)
+    y_values = train_x[['dx']].values.astype(float)
+
+    date_label = pd.DatetimeIndex(train_x.trade_date).to_pydatetime()
     dates = np.unique(date_label)
 
     if dates[-1] == dt.datetime.strptime(ref_date, '%Y-%m-%d'):
@@ -383,6 +427,7 @@ def fetch_predict_phase(engine,
         left_index = bisect.bisect_left(date_label, start)
         right_index = bisect.bisect_right(date_label, end)
         this_raw_x = x_values[left_index:right_index]
+        this_raw_y = y_values[left_index:right_index]
         sub_dates = date_label[left_index:right_index]
 
         if risk_exp is not None:
@@ -395,10 +440,16 @@ def fetch_predict_phase(engine,
                                  risk_factors=this_risk_exp,
                                  post_process=post_process)
 
+        ne_y = factor_processing(this_raw_y,
+                                 pre_process=pre_process,
+                                 risk_factors=this_risk_exp,
+                                 post_process=post_process)
+
         inner_left_index = bisect.bisect_left(sub_dates, end)
         inner_right_index = bisect.bisect_right(sub_dates, end)
 
         ne_x = ne_x[inner_left_index:inner_right_index]
+        ne_y = ne_y[inner_left_index:inner_right_index]
 
         left_index = bisect.bisect_left(date_label, end)
         right_index = bisect.bisect_right(date_label, end)
@@ -406,23 +457,12 @@ def fetch_predict_phase(engine,
         codes = train_x.code.values[left_index:right_index]
     else:
         ne_x = None
+        ne_y = None
         codes = None
 
     ret = dict()
     ret['x_names'] = transformer.names
-    ret['predict'] = {'x': pd.DataFrame(ne_x, columns=transformer.names), 'code': codes}
+    ret['predict'] = {'x': pd.DataFrame(ne_x, columns=transformer.names), 'code': codes, 'y': ne_y.flatten()}
 
     return ret
 
-
-if __name__ == '__main__':
-    engine = SqlEngine('postgresql+psycopg2://postgres:A12345678!@10.63.6.220/alpha')
-    universe = Universe('zz500', ['hs300', 'zz500'])
-    neutralized_risk = ['SIZE']
-    res = fetch_predict_phase(engine, ['ep_q'],
-                              '2012-01-05',
-                              '5b',
-                              universe,
-                              16,
-                              neutralized_risk=neutralized_risk)
-    print(res)
